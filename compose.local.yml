@@ -1,0 +1,23 @@
+# 用于 Aether 以 host 网络模式运行的机器：本服务同样用 host 网络，只监听 127.0.0.1，
+# Aether 中端点 Base URL 填 http://127.0.0.1:3060/v1
+services:
+  cline-proxy:
+    build: .
+    image: cline-proxy:local
+    container_name: cline-proxy
+    network_mode: host
+    environment:
+      PORT: "3060"
+      HOST: "127.0.0.1"
+      UPSTREAM_BASE_URL: "https://api.cline.bot/api/v1"
+      MODEL_PREFIX: "cline-pass/"
+      LOG_LEVEL: "info"
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

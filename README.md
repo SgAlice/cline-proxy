@@ -49,6 +49,20 @@ http://cline-proxy:3060/v1
 
 Key 和模型映射（如 `cline-pass/deepseek-v4.1-flash`）保持不变，不需要开启 Aether 的格式转换。
 
+### Aether 使用 host 网络模式时
+
+如果 Aether 容器是 `network_mode: host`（不在 `aether_default` 网络里），改用：
+
+```bash
+docker compose -f compose.local.yml up -d --build
+```
+
+本服务同样使用 host 网络，只监听 `127.0.0.1:3060`，不对外暴露。Aether 端点 Base URL 填：
+
+```
+http://127.0.0.1:3060/v1
+```
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |

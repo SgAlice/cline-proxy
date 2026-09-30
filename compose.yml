@@ -1,0 +1,29 @@
+services:
+  cline-proxy:
+    build: .
+    image: cline-proxy:local
+    container_name: cline-proxy
+    environment:
+      PORT: "3060"
+      HOST: "0.0.0.0"
+      # 上游地址与 Aether 中 cline 供应商原来配置的一致；API Key 由 Aether 通过 Authorization 头透传
+      UPSTREAM_BASE_URL: "https://api.cline.bot/api/v1"
+      # 模型名不含 "/" 时自动补前缀（Aether 已映射为 cline-pass/...，此处仅兜底）
+      MODEL_PREFIX: "cline-pass/"
+      LOG_LEVEL: "info"
+    ports:
+      - "127.0.0.1:3060:3060"
+    networks: [aether]
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+networks:
+  aether:
+    external: true
+    name: aether_default

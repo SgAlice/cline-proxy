@@ -11,7 +11,8 @@
 
 import http from 'node:http';
 import zlib from 'node:zlib';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import { prepareResponsesCompatibility } from './responses-compat.mjs';
 
 const PORT = Number(process.env.PORT || 3060);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -329,101 +330,47 @@ function toolOutputContent(output) {
   return { text: output === undefined || output === null ? '' : String(output), images: [] };
 }
 
-// 工具转换上下文：记录哪些 Chat 函数名需要在输出时还原成 custom / namespace / local_shell
-function newToolCtx() {
-  return { custom: new Set(), localShell: false, flat: new Map() /* flatName -> {namespace, name} */ };
-}
-
-// namespace 工具（Codex 的 MCP 工具）展开为 `${namespace}__${name}`；超过 64 字符则截断加哈希
-function flatName(ctx, namespace, name) {
-  let flat = `${namespace}__${name}`.replace(/[^a-zA-Z0-9_-]/g, '_');
-  if (flat.length > 64) flat = flat.slice(0, 55) + '_' + createHash('sha1').update(`${namespace}\0${name}`).digest('hex').slice(0, 8);
-  ctx.flat.set(flat, { namespace, name });
-  return flat;
-}
-
-function functionTool(fn, nameOverride) {
-  return {
-    type: 'function',
-    function: {
-      name: nameOverride || fn.name,
-      description: fn.description || '',
-      parameters: fn.parameters || { type: 'object', properties: {} },
-      ...(fn.strict !== undefined ? { strict: fn.strict } : {}),
-    },
+// Reuse the deployed Command Code Responses Lite registry. Keep Cline's
+// legacy local_shell declaration as a JSON function on the upstream wire.
+function prepareClineCompatibility(r) {
+  let localShell = false;
+  const normalizeTools = tools => {
+    if (tools == null) return tools;
+    if (!Array.isArray(tools)) throw new Error('Responses tools must be an array');
+    return tools.map(t => {
+      if (t?.type === 'namespace') return { ...t, tools: normalizeTools(t.tools) };
+      if (t?.type === 'local_shell') {
+        localShell = true;
+        return { type: 'function', name: 'local_shell', description: 'Run a shell command locally.',
+          parameters: { type: 'object', properties: {
+            command: { type: 'array', items: { type: 'string' } },
+            workdir: { type: 'string' }, timeout_ms: { type: 'number' },
+          }, required: ['command'] } };
+      }
+      if (t?.type === 'function' && t.function) return { ...t.function, type: 'function' };
+      if (t && !t.type && t.name) return { ...t, type: 'function' };
+      return t;
+    });
   };
-}
-
-// 自定义（freeform）工具 → function 工具，参数只有一个 input 字符串
-const CUSTOM_INPUT_KEY = 'input';
-function convertTools(tools, ctx) {
-  const out = [];
-  for (const t of tools || []) {
-    if (!t || typeof t !== 'object') continue;
-    if (t.type === 'function' || (!t.type && t.name)) {
-      out.push(functionTool(t.function || t));
-    } else if (t.type === 'namespace' && Array.isArray(t.tools)) {
-      for (const sub of t.tools) {
-        if (!sub || (sub.type && sub.type !== 'function')) continue;
-        const flat = flatName(ctx, t.name, sub.name);
-        const tool = functionTool(sub, flat);
-        if (t.description && !tool.function.description.includes(t.description)) {
-          tool.function.description = `[${t.name}] ${tool.function.description}`;
-        }
-        out.push(tool);
-      }
-    } else if (t.type === 'custom') {
-      ctx.custom.add(t.name);
-      let desc = t.description || '';
-      const fmt = t.format;
-      if (fmt && fmt.type === 'grammar' && fmt.definition) {
-        desc += `\n\nThe "${CUSTOM_INPUT_KEY}" argument is raw text (not JSON) and must follow this ${fmt.syntax || ''} grammar:\n${fmt.definition}`;
-      }
-      out.push({
-        type: 'function',
-        function: {
-          name: t.name,
-          description: desc,
-          parameters: {
-            type: 'object',
-            properties: { [CUSTOM_INPUT_KEY]: { type: 'string', description: 'Raw freeform input for this tool.' } },
-            required: [CUSTOM_INPUT_KEY],
-          },
-        },
-      });
-    } else if (t.type === 'local_shell') {
-      out.push({
-        type: 'function',
-        function: {
-          name: 'local_shell',
-          description: 'Run a shell command locally.',
-          parameters: {
-            type: 'object',
-            properties: {
-              command: { type: 'array', items: { type: 'string' } },
-              workdir: { type: 'string' },
-              timeout_ms: { type: 'number' },
-            },
-            required: ['command'],
-          },
-        },
-      });
-      ctx.localShell = true;
-    } else {
-      log('debug', 'dropping unsupported tool type', { type: t.type, name: t.name });
-    }
+  const request = { ...r, tools: normalizeTools(r.tools),
+    input: Array.isArray(r.input) ? r.input.map(item => item?.type === 'additional_tools'
+      ? { ...item, tools: normalizeTools(item.tools) } : item) : r.input };
+  if (request.input != null && typeof request.input !== 'string' && !Array.isArray(request.input)) {
+    throw new Error('Responses input must be a string or array');
   }
-  return out;
+  return { ...prepareResponsesCompatibility(request), localShell };
 }
 
 function responsesToChat(r) {
   const messages = [];
-  const ctx = newToolCtx();
+  const ctx = prepareClineCompatibility(r);
 
   if (r.instructions) {
     const sys = textOfContent(r.instructions);
     if (sys) messages.push({ role: 'system', content: sys });
   }
+
+  if (ctx.capabilityNotice) messages.push({ role: 'system', content: ctx.capabilityNotice });
 
   // reasoning / assistant message / tool calls 在 Responses 里是并列 item，
   // 在 Chat 里要合并到同一条 assistant 消息上。
@@ -450,9 +397,9 @@ function responsesToChat(r) {
     pendingImages.push(...images);
   };
 
-  const input = typeof r.input === 'string' ? [{ type: 'message', role: 'user', content: r.input }] : (r.input || []);
+  const input = typeof ctx.input === 'string' ? [{ type: 'message', role: 'user', content: ctx.input }] : (ctx.input || []);
   for (const item of input) {
-    if (!item || typeof item !== 'object') continue;
+    if (!item || typeof item !== 'object') throw new Error('Invalid Responses input item');
     const type = item.type ?? (item.role ? 'message' : undefined);
     if (!/_output$/.test(type || '')) flushImages();
     switch (type) {
@@ -487,16 +434,9 @@ function responsesToChat(r) {
           id: item.call_id || item.id || newId('call_'),
           type: 'function',
           function: {
-            name: item.namespace ? flatName(ctx, item.namespace, item.name || '') : (item.name || ''),
+            name: item.name || '',
             arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments || {}),
           },
-        });
-        break;
-      case 'custom_tool_call':
-        ensure().tool_calls.push({
-          id: item.call_id || item.id || newId('call_'),
-          type: 'function',
-          function: { name: item.name || '', arguments: JSON.stringify({ [CUSTOM_INPUT_KEY]: item.input ?? '' }) },
         });
         break;
       case 'local_shell_call':
@@ -512,8 +452,7 @@ function responsesToChat(r) {
         pushToolResult(item.call_id, item.output);
         break;
       default:
-        log('debug', 'dropping unsupported input item', { type });
-        break;
+        throw new Error(`Unsupported Responses input item type: ${type}`);
     }
   }
   flush();
@@ -546,12 +485,10 @@ function responsesToChat(r) {
     stream: true,
     stream_options: { include_usage: true },
   };
-  const tools = convertTools(r.tools, ctx);
+  const tools = ctx.tools;
   if (tools.length) {
     chat.tools = tools;
-    const tc = r.tool_choice;
-    if (typeof tc === 'string') chat.tool_choice = tc;
-    else if (tc && typeof tc === 'object' && tc.name) chat.tool_choice = { type: 'function', function: { name: tc.name } };
+    if (ctx.toolChoice != null) chat.tool_choice = ctx.toolChoice;
     if (r.parallel_tool_calls !== undefined) chat.parallel_tool_calls = r.parallel_tool_calls;
   }
   if (r.max_output_tokens != null) chat.max_tokens = r.max_output_tokens;
@@ -593,6 +530,7 @@ class ResponsesBuilder {
     this.model = req.model;
     this.output = [];
     this.current = null; // { kind, item, index, text }
+    this.toolInputBytes = 0;
     this.toolCalls = new Map(); // index -> {id,name,args}
     this.usage = null;
     this.finishReason = null;
@@ -703,6 +641,8 @@ class ResponsesBuilder {
         let acc = this.toolCalls.get(idx);
         if (!acc) { acc = { id: tc.id || newId('call_'), name: '', args: '' }; this.toolCalls.set(idx, acc); }
         if (tc.id) acc.id = tc.id;
+        this.toolInputBytes += Buffer.byteLength(JSON.stringify(tc));
+        if (this.toolInputBytes > 16 * 1024 * 1024) throw new Error('Upstream tool input exceeds the compatibility buffer limit');
         if (tc.function?.name) acc.name += tc.function.name;
         if (typeof tc.function?.arguments === 'string') acc.args += tc.function.arguments;
         else if (tc.function?.arguments && typeof tc.function.arguments === 'object') acc.args = JSON.stringify(tc.function.arguments);
@@ -718,13 +658,9 @@ class ResponsesBuilder {
     for (const [, tc] of entries) {
       const index = this.output.length;
       let item;
-      if (this.ctx.custom.has(tc.name)) {
-        let input = tc.args;
-        try {
-          const parsed = JSON.parse(tc.args || '{}');
-          if (parsed && typeof parsed === 'object' && typeof parsed[CUSTOM_INPUT_KEY] === 'string') input = parsed[CUSTOM_INPUT_KEY];
-        } catch {}
-        item = { id: newId('ctc_'), type: 'custom_tool_call', status: 'completed', call_id: tc.id, name: tc.name, input };
+      if (this.ctx.isCustomTool(tc.name)) {
+        item = this.ctx.outputCall(tc.name, tc.args, tc.id, newId('ctc_'));
+        const input = item.input;
         this.output.push(item);
         await this.ev('response.output_item.added', { output_index: index, item: { ...item, input: '', status: 'in_progress' } });
         await this.ev('response.custom_tool_call_input.delta', { item_id: item.id, output_index: index, delta: input });
@@ -737,8 +673,7 @@ class ResponsesBuilder {
         await this.ev('response.output_item.added', { output_index: index, item });
       } else {
         const args = tc.args || '{}';
-        const ns = this.ctx.flat.get(tc.name);
-        item = { id: newId('fc_'), type: 'function_call', status: 'completed', call_id: tc.id, name: ns ? ns.name : tc.name, ...(ns ? { namespace: ns.namespace } : {}), arguments: args };
+        item = this.ctx.outputCall(tc.name, args, tc.id, newId('fc_'));
         this.output.push(item);
         await this.ev('response.output_item.added', { output_index: index, item: { ...item, arguments: '', status: 'in_progress' } });
         await this.ev('response.function_call_arguments.delta', { item_id: item.id, output_index: index, delta: args });
@@ -840,6 +775,7 @@ async function handleResponses(req, res) {
     upstreamErr = e.message;
   }
   if (ac.signal.aborted) return;
+  if (!upstreamErr && !b.finishReason) upstreamErr = 'Upstream stream ended without a finish reason';
 
   if (upstreamErr) {
     log('warn', 'responses upstream stream error', { error: upstreamErr, ms: Date.now() - t0 });
@@ -852,7 +788,13 @@ async function handleResponses(req, res) {
     if (!headersSent) return sendError(res, 502, 'Empty response from upstream');
   }
 
-  const resp = await b.finish();
+  let resp;
+  try { resp = await b.finish(); } catch (e) {
+    log('warn', 'responses compatibility error', { error: e.message });
+    if (!headersSent) return sendError(res, 502, e.message);
+    await b.fail(e.message);
+    return res.end();
+  }
   log('info', 'responses done', {
     stream, model: r.model, ms: Date.now() - t0, items: resp.output.map((o) => o.type).join(','),
     in: resp.usage.input_tokens, out: resp.usage.output_tokens, finish: b.finishReason,

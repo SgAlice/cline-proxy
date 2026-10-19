@@ -1,6 +1,6 @@
 FROM node:22-alpine
 WORKDIR /app
-COPY proxy.mjs ./
+COPY proxy.mjs responses-compat.mjs LICENSE.commandcode ./
 ENV NODE_ENV=production PORT=3060 HOST=0.0.0.0
 EXPOSE 3060
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

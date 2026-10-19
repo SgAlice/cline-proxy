@@ -1,6 +1,6 @@
 # cline-proxy
 
-把 Cline（`api.cline.bot`）包装成标准 OpenAI 接口的转发服务，放在 Aether 网关和 Cline 之间使用。单文件、零依赖，Node.js ≥ 22。
+把 Cline（`api.cline.bot`）包装成标准 OpenAI 接口的转发服务，放在 Aether 网关和 Cline 之间使用。零依赖，Node.js ≥ 22。
 
 ## 为什么需要它
 
@@ -23,7 +23,7 @@
 - 推理：输出为 `reasoning` item（摘要 + `encrypted_content` 中保存完整推理，回传时还原为 `reasoning_content`）
 - 函数工具 `function`
 - 自定义 freeform 工具 `custom`（如 Codex 的 `apply_patch`）：转成只有一个 `input` 字符串参数的函数，输出时还原为 `custom_tool_call`
-- 命名空间工具 `namespace`（Codex 的 MCP 工具）：展开为 `${namespace}__${name}`（超过 64 字符截断加哈希），输出时还原为带 `namespace` 字段的 `function_call`
+- 命名空间工具 `namespace`：支持 function 和 custom；采用请求级、抗碰撞别名，输出还原原始名称、namespace 和工具类型。
 - `local_shell`
 - 多轮历史中的 `function_call` / `custom_tool_call` / `*_output`，并自动补齐或清理不成对的工具结果
 - `reasoning.effort`、`max_output_tokens`、`temperature`、`top_p`、`text.format`（json_schema / json_object）
@@ -82,3 +82,48 @@ docker logs -f cline-proxy
 ```
 
 每个请求一行 JSON：`chat done` / `responses done`，包含耗时、token 数、输出 item 类型和结束原因。
+
+
+## Codex 子代理适配（2026-10-07）
+
+复用 commandcode-proxy 的 `responses-compat.mjs`，保留 MIT 许可于
+`LICENSE.commandcode`。Cline 的鉴权、模型前缀与 Chat 接口保持原样。
+
+- 接入 `additional_tools` 动态工具目录，保留 `strict` 与自定义 grammar 描述。
+- 将 `agent_message` 的明文任务送入用户消息，兼容把明文放进
+  `encrypted_content` 的第三方载体；这**不是解密**。可识别 Fernet 密文返回 400，
+  其他密码格式也不具备解密能力，必须由父侧保证明文。
+- `namespace` 内的 freeform/custom 工具以 `{input: string}` 传输，支持 Unicode、
+  原始文本、JSON 字符串、并行交错分片；恢复原始 call ID、命名空间和 custom SSE 事件。
+- 历史工具及结果采用相同映射；未知或歧义工具报错，不猜测名称、不执行 DSML 文本。
+- 可选 hosted web search 省略时明确告知模型能力边界；强制 search 返回 400。
+- 未结束的上游流和还原失败不伪造 `response.completed`，工具输入缓冲上限 16 MiB。
+- 保留原来的 `clinepx1:` 推理状态往返。它是 base64 兼容载体，不是真正加密。
+
+### 父代理前提
+
+跨服务商真实密文不能由子代理中转解密。父侧需要在生成派发工具调用前去掉
+`message.encrypted` 并适配 collaboration 命名空间。机器上已有独立服务
+`commandcode-parent-compat`（loopback 3051），但迁移本服务不会自动修改其他
+供应商路由。若父代理仍产出密文，需为其当前上游单独配置父侧兼容链路，然后重新派发。
+不要把 DeepSeek 子代理流量转入 native Responses 父侧代理。
+
+### 无网络回归测试
+
+```sh
+# tests 通过只读挂载；mock fetch 不调用 Cline、不使用真实密钥。
+docker run --rm --network none --read-only --user node \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  -v "$PWD/tests:/app/tests:ro" --entrypoint node cline-proxy:local \
+  tests/responses-codex.mjs
+```
+
+### 本次部署验收
+
+- 2026-10-07：本机与服务器 Node 22 禁网 mock 均通过 42/42 项回归。
+- Cline `cline-pass/deepseek-v4.1-flash`：候选端口与正式端口各 4 次真实请求，
+  JSON/SSE 的 namespaced custom echo 及工具结果续接全部通过；没有执行模型生成代码。
+- 等待原端口零连接窗口后切换，健康检查通过；未变更网关端点、凭证、模型映射或父侧路由。
+- 原源码：`/opt/cline-proxy-backup-20261007-codex`；
+  原镜像：`cline-proxy:rollback-20261007-codex`。
+- 临时候选容器已停止。当前验证是协议层真实模型往返，不是完整 Codex 原生子代理会话验收。
